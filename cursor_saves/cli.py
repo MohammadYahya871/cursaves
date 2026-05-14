@@ -578,53 +578,16 @@ def _select_workspace() -> tuple[str, "Path", str | None] | None:
 
     Returns (project_path, workspace_dir, host) for the selected workspace, or None.
     """
+    from .interactive import select_workspace as tui_select_workspace
+
     workspaces = paths.list_workspaces_with_conversations()
     if not workspaces:
         print("No Cursor workspaces found.")
         return None
 
-    print(f"\nCursor workspaces (most recent first)\n")
-    print(f"  {'#':<4} {'Project':<40} {'Chats':>5}  {'Sync Status'}")
-    print(f"  {'-' * 80}")
-
-    global_db_path = paths.get_global_db_path()
-    global_cdb = db.CursorDB(global_db_path) if global_db_path.exists() else None
-    try:
-        for i, ws in enumerate(workspaces, 1):
-            name = os.path.basename(os.path.normpath(ws["path"])) or ws["path"]
-            ws_type = ws.get("type", "local")
-            host = ws.get("host", "")
-            label = f"{name} ({host})" if host else name
-            if len(label) > 38:
-                label = label[:35] + "..."
-            convos = ws.get("conversations", 0)
-            sync = _workspace_sync_summary(ws, _global_cdb=global_cdb)
-            print(f"  {i:<4} {label:<40} {convos:>5}  {sync}")
-    finally:
-        if global_cdb:
-            global_cdb.close()
-
-    print(f"\nSelect a workspace:")
-    try:
-        choice = input("> ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
+    ws = tui_select_workspace(workspaces)
+    if ws is None:
         return None
-
-    if not choice:
-        return None
-
-    try:
-        idx = int(choice)
-    except ValueError:
-        print(f"Invalid selection: {choice}", file=sys.stderr)
-        return None
-
-    if idx < 1 or idx > len(workspaces):
-        print(f"#{idx} out of range.", file=sys.stderr)
-        return None
-
-    ws = workspaces[idx - 1]
     return ws["path"], ws["workspace_dir"], ws.get("host")
 
 
@@ -633,6 +596,8 @@ def _select_conversations(project_path: str, prompt: str = "push", workspace_dir
 
     Returns a list of selected composer IDs, or empty list.
     """
+    from .interactive import select_conversations as tui_select_conversations
+
     conversations = export.list_conversations(project_path, workspace_dir=workspace_dir)
     if not conversations:
         print(f"No conversations found for {project_path}")
@@ -641,35 +606,9 @@ def _select_conversations(project_path: str, prompt: str = "push", workspace_dir
     conversations.sort(key=lambda c: c.get("lastUpdated", ""), reverse=True)
 
     project_name = os.path.basename(os.path.normpath(project_path)) or project_path
-    project_id = paths.get_project_identifier(project_path)
-    print(f"\n  Conversations in {project_name}  ({len(conversations)} total)\n")
-    print(f"  {'#':<4} {'Name':<36} {'Msgs':>5}  {'Last Updated':<20} {'Status'}")
-    print(f"  {'-' * 95}")
+    print(f"\n  {project_name}: {len(conversations)} conversation(s)\n")
 
-    global_db_path = paths.get_global_db_path()
-    with db.CursorDB(global_db_path) as global_cdb:
-        for i, c in enumerate(conversations, 1):
-            name = c["name"]
-            if len(name) > 34:
-                name = name[:31] + "..."
-            status = get_push_status_for_conversation(c["id"], project_id, _cdb=global_cdb)
-            status_label = format_sync_status(status)
-            print(
-                f"  {i:<4} {name:<36} {c['messageCount']:>5}  {c['lastUpdated']:<20} {status_label}"
-            )
-
-    print(f"\n  Select chats to {prompt} (e.g. 1,3,5 or 1-3 or 'all') [all]:")
-    try:
-        choice = input("  > ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return []
-
-    if not choice:
-        choice = "all"
-
-    indices = _parse_selection(choice, len(conversations))
-    return [conversations[i - 1]["id"] for i in indices]
+    return tui_select_conversations(conversations, action=prompt)
 
 
 def _find_ahead_conversations() -> list[dict]:
@@ -1142,44 +1081,32 @@ def cmd_pull(args):
 
     # Step 2: Select what to import
     if args.select:
+        from .interactive import select_one, select_snapshots
+
         # Interactive: show available snapshot projects and let user pick
         projects = list_snapshot_projects()
         if not projects:
             print("No snapshots found. Run 'cursaves push' on another machine first.")
             return
 
-        print(f"\n  Available projects:\n")
-        print(f"  {'#':<4} {'Project':<30} {'Chats':>5}  {'Last Saved':<20} {'Source'}")
-        print(f"  {'-' * 85}")
-
-        for i, p in enumerate(projects, 1):
+        # Select project with fuzzy search
+        project_choices = []
+        for p in projects:
             sources = ", ".join(sorted(p["sources"])) or "unknown"
-            name = p["name"]
-            if len(name) > 28:
-                name = name[:25] + "..."
             last_saved = p.get("latest_export", "")[:16] or "unknown"
-            print(f"  {i:<4} {name:<30} {p['count']:>5}  {last_saved:<20} {sources}")
+            display = f"{p['name']:<30} {p['count']:>3} chats  {last_saved}  from {sources}"
+            project_choices.append({"name": display, "_project": p})
 
-        print(f"\n  Select project (e.g. 1):")
-        try:
-            choice = input("  > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-
-        if not choice:
-            return
-
-        indices = _parse_selection(choice, len(projects))
-        if not indices:
+        selected_project = select_one(
+            project_choices, message="Select project to import from:"
+        )
+        if not selected_project:
             return
 
         total_success = 0
         total_failure = 0
-        for idx in indices:
-            project = projects[idx - 1]
-
-            # Show individual snapshots with dates for this project
+        for project in [selected_project["_project"]]:
+            # Build snapshot list for this project
             snapshot_files = list_snapshot_files(project["path"])
             snapshots_info = []
             for sf in snapshot_files:
@@ -1198,41 +1125,12 @@ def cmd_pull(args):
                 print(f"  No snapshots in {project['name']}/")
                 continue
 
-            print(f"\n  Chats in {project['name']}:\n")
-            print(f"  {'#':<4} {'Name':<36} {'Msgs':>5}  {'From':<16} {'Local Status'}")
-            print(f"  {'-' * 90}")
-
-            for i, si in enumerate(snapshots_info, 1):
-                name = si["name"]
-                if len(name) > 34:
-                    name = name[:31] + "..."
-                cid = si.get("composerId")
-                if cid:
-                    status = get_sync_status_for_snapshot(cid, si["msgs"])
-                    status_label = format_sync_status(status)
-                else:
-                    status_label = ""
-                source = si["source"]
-                if len(source) > 14:
-                    source = source[:11] + "..."
-                print(f"  {i:<4} {name:<36} {si['msgs']:>5}  {source:<16} {status_label}")
-
-            print(f"\n  Select chats to import (e.g. 1,3,5 or 1-3 or 'all') [all]:")
-            try:
-                snap_choice = input("  > ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
+            # Interactive snapshot selection
+            selected_snaps = select_snapshots(snapshots_info)
+            if not selected_snaps:
                 continue
 
-            if not snap_choice:
-                snap_choice = "all"
-
-            snap_indices = _parse_selection(snap_choice, len(snapshots_info))
-            if not snap_indices:
-                continue
-
-            selected_files = [snapshots_info[i - 1]["file"] for i in snap_indices]
-            selected_names = [snapshots_info[i - 1]["name"] for i in snap_indices]
+            selected_files = [s["file"] for s in selected_snaps]
             print(f"\n  Importing {len(selected_files)} chat(s) from {project['name']}/...")
 
             # Find target workspace
@@ -1465,40 +1363,37 @@ def cmd_delete(args):
 
     # --select: interactive selection across projects
     if args.select:
+        from .interactive import select_many, confirm as tui_confirm
+
         projects = list_snapshot_projects(snapshots_base)
         if not projects:
             print("No snapshots found.")
             return
 
-        print(f"\nSnapshot projects:\n")
-        print(f"  {'#':<4} {'Project':<40} {'Chats':>5}  {'Source'}")
-        print(f"  {'-' * 70}")
-
-        for i, p in enumerate(projects, 1):
+        project_choices = []
+        for p in projects:
             sources = ", ".join(sorted(p["sources"])) or "unknown"
-            name = p["name"]
-            if len(name) > 38:
-                name = name[:35] + "..."
-            print(f"  {i:<4} {name:<40} {p['count']:>5}  {sources}")
+            display = f"{p['name']:<40} {p['count']:>3} chats  from {sources}"
+            project_choices.append({"name": display, "_project": p})
 
-        print(f"\nSelect project(s) to delete (e.g. 1,3 or 1-3 or 'all'):")
-        try:
-            choice = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
+        selected = select_many(
+            project_choices,
+            message="Select projects to delete (space=toggle, type to filter):",
+            name_key="name",
+        )
+        if not selected:
             return
 
-        if not choice:
-            return
+        selected_projects = [s["_project"] for s in selected]
+        total_count = sum(p["count"] for p in selected_projects)
 
-        indices = _parse_selection(choice, len(projects))
-        if not indices:
+        if not tui_confirm(f"Delete {total_count} snapshot(s) across {len(selected_projects)} project(s)?"):
+            print("Cancelled.")
             return
 
         total_deleted = 0
         deleted_names = []
-        for idx in indices:
-            p = projects[idx - 1]
+        for p in selected_projects:
             shutil.rmtree(p["path"])
             print(f"  Deleted: {p['name']}/ ({p['count']} snapshots)")
             total_deleted += p["count"]
@@ -1709,6 +1604,7 @@ def cmd_doctor(args):
 def cmd_purge(args):
     """Delete chats from Cursor's database to reclaim space."""
     from .importer import list_all_chats_with_sizes, purge_chats
+    from .interactive import select_purge_chats, confirm as tui_confirm
 
     force = getattr(args, "force", False)
     ws_filter = getattr(args, "workspace", None)
@@ -1720,7 +1616,6 @@ def cmd_purge(args):
         print("  No chats found.")
         return
 
-    # Filter by workspace if requested
     if ws_filter:
         ws_filter_lower = ws_filter.lower()
         all_chats = [
@@ -1731,102 +1626,17 @@ def cmd_purge(args):
             print(f"  No chats matching workspace '{ws_filter}'.")
             return
 
-    # Separate chats with content from empty stubs
     with_content = [c for c in all_chats if c["messageCount"] > 0 or c["name"]]
     stubs = [c for c in all_chats if c["messageCount"] == 0 and not c["name"]]
-
     total_keys = sum(c["keyCount"] for c in all_chats)
-    content_keys = sum(c["keyCount"] for c in with_content)
-    stub_keys = sum(c["keyCount"] for c in stubs)
 
     print(
-        f"  ─── Chat Summary ─────────────────────────────────────────\n\n"
-        f"  Total chats:        {len(all_chats)}\n"
-        f"  With content:       {len(with_content)} ({content_keys:,} DB keys)\n"
-        f"  Empty stubs:        {len(stubs)} ({stub_keys:,} DB keys)\n"
-        f"  Total DB keys:      {total_keys:,}\n"
+        f"  Found {len(all_chats)} chats ({total_keys:,} DB keys)\n"
+        f"  {len(with_content)} with content, {len(stubs)} empty stubs\n"
     )
 
-    # Group by workspace for display
-    by_ws: dict[str, list[dict]] = {}
-    for c in with_content:
-        by_ws.setdefault(c["workspace_label"], []).append(c)
-
-    print(f"  ─── Chats by workspace ───────────────────────────────────\n")
-    ws_list = sorted(by_ws.items(), key=lambda x: sum(c["keyCount"] for c in x[1]), reverse=True)
-
-    chat_index: dict[int, dict] = {}
-    idx = 1
-    for ws_label, chats in ws_list:
-        ws_keys = sum(c["keyCount"] for c in chats)
-        print(f"  {ws_label} ({len(chats)} chats, {ws_keys:,} keys)")
-        for c in sorted(chats, key=lambda x: x["keyCount"], reverse=True):
-            name = c["name"][:38] or "(unnamed)"
-            print(
-                f"    {idx:>3}. {name:<40} "
-                f"{c['messageCount']:>4} msgs  "
-                f"{c['keyCount']:>5} keys"
-            )
-            chat_index[idx] = c
-            idx += 1
-        print()
-
-    if stubs:
-        print(f"  + {len(stubs)} empty stubs (select 'stubs' to purge them)\n")
-
-    print(
-        f"  Select chats to delete:\n"
-        f"    Numbers:    1,3,5  or  1-10  or  1-3,7,9-12\n"
-        f"    Workspace:  all:<name>  (e.g. all:RankThis)\n"
-        f"    Stubs:      stubs  (delete all empty stubs)\n"
-        f"    Everything: all\n"
-        f"    Cancel:     q\n"
-    )
-
-    try:
-        choice = input("  > ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Cancelled.")
-        return
-
-    if not choice or choice.lower() == "q":
-        print("  Cancelled.")
-        return
-
-    selected_ids: list[str] = []
-
-    if choice.lower() == "all":
-        selected_ids = [c["composerId"] for c in all_chats]
-        print(f"\n  Selected ALL {len(selected_ids)} chats (including stubs).")
-    elif choice.lower() == "stubs":
-        selected_ids = [c["composerId"] for c in stubs]
-        print(f"\n  Selected {len(selected_ids)} empty stubs.")
-    elif choice.lower().startswith("all:"):
-        ws_name = choice[4:].strip().lower()
-        for c in all_chats:
-            if ws_name in c["workspace_label"].lower():
-                selected_ids.append(c["composerId"])
-        if not selected_ids:
-            print(f"  No chats matching workspace '{ws_name}'.")
-            return
-        print(f"\n  Selected {len(selected_ids)} chats from matching workspace(s).")
-    else:
-        # Parse number ranges
-        try:
-            for part in choice.split(","):
-                part = part.strip()
-                if "-" in part:
-                    start, end = part.split("-", 1)
-                    for n in range(int(start), int(end) + 1):
-                        if n in chat_index:
-                            selected_ids.append(chat_index[n]["composerId"])
-                else:
-                    n = int(part)
-                    if n in chat_index:
-                        selected_ids.append(chat_index[n]["composerId"])
-        except ValueError:
-            print("  Invalid selection.")
-            return
+    # Use interactive TUI for selection
+    selected_ids = select_purge_chats(with_content + stubs)
 
     if not selected_ids:
         print("  Nothing selected.")
@@ -1839,13 +1649,8 @@ def cmd_purge(args):
         f"\n  Will delete {len(selected_ids)} chat(s) "
         f"({selected_keys:,} DB keys)."
     )
-    try:
-        confirm = input("  Continue? [y/N] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Cancelled.")
-        return
 
-    if confirm not in ("y", "yes"):
+    if not tui_confirm("Continue with deletion?"):
         print("  Cancelled.")
         return
 
