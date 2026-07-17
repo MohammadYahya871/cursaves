@@ -13,20 +13,32 @@ from typing import Optional
 def get_cursor_user_dir() -> Path:
     """Return the Cursor User data directory for the current platform.
 
-    macOS:  ~/Library/Application Support/Cursor/User
-    Linux:  ~/.config/Cursor/User
+    macOS:   ~/Library/Application Support/Cursor/User
+    Linux:   ~/.config/Cursor/User
+    Windows: %APPDATA%/Cursor/User
     """
     system = platform.system()
     if system == "Darwin":
         base = Path.home() / "Library" / "Application Support" / "Cursor" / "User"
     elif system == "Linux":
         base = Path.home() / ".config" / "Cursor" / "User"
+    elif system == "Windows":
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            print(
+                "Error: APPDATA environment variable is not set.\n"
+                "Cannot locate Cursor data on Windows.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        base = Path(appdata) / "Cursor" / "User"
     else:
         print(
             f"Error: Unsupported platform '{system}'.\n"
-            f"cursaves supports macOS and Linux.\n"
+            f"This fork supports macOS, Linux, and Windows.\n"
             f"On macOS, Cursor data is at ~/Library/Application Support/Cursor/User/\n"
-            f"On Linux, Cursor data is at ~/.config/Cursor/User/",
+            f"On Linux, Cursor data is at ~/.config/Cursor/User/\n"
+            f"On Windows, Cursor data is at %APPDATA%\\Cursor\\User\\",
             file=sys.stderr,
         )
         sys.exit(1)

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cursaves"
-version = "0.9.1"
+version = "0.9.2"
 description = "Sync Cursor agent chat sessions between machines"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -21,4 +21,4 @@ cursaves = "cursor_saves.cli:main"
 packages = ["cursor_saves"]
 
 [project.urls]
-Repository = "https://github.com/Callum-Ward/cursaves"
+Repository = "https://github.com/MohammadYahya871/cursaves"

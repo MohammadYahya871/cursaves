@@ -3,6 +3,7 @@
 import gzip
 import json
 import os
+import platform
 import subprocess
 import sys
 import uuid
@@ -108,7 +109,40 @@ def is_cursor_running() -> bool:
     characters. Instead we parse `ps -axo args` and look for the main
     Cursor executable while excluding helpers, crash handlers, and the
     macOS CursorUIViewService system process.
+
+    On Linux, look for the main Cursor binary (exclude helpers / --type= children).
+    On Windows, look for Cursor.exe via tasklist.
     """
+    system = platform.system()
+
+    if system == "Windows":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq Cursor.exe", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0 and "Cursor.exe" in result.stdout:
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-Process -Name Cursor -ErrorAction SilentlyContinue | Measure-Object).Count",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return result.stdout.strip() not in ("", "0")
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
     try:
         result = subprocess.run(
             ["ps", "-axo", "args"],
@@ -118,10 +152,24 @@ def is_cursor_running() -> bool:
         if result.returncode != 0:
             return False
         for line in result.stdout.splitlines():
-            if "Cursor.app/Contents/MacOS/Cursor" in line \
-                    and "Helper" not in line \
-                    and "Frameworks" not in line:
+            # macOS app bundle
+            if (
+                "Cursor.app/Contents/MacOS/Cursor" in line
+                and "Helper" not in line
+                and "Frameworks" not in line
+            ):
                 return True
+            # Linux main binary
+            if system == "Linux":
+                lower = line.lower()
+                if "cursaves" in lower or "cursor-sync" in lower:
+                    continue
+                if "--type=" in line or "crashpad" in lower or "zygote" in lower:
+                    continue
+                first = line.strip().split()[0] if line.strip() else ""
+                base = os.path.basename(first).lower()
+                if base == "cursor":
+                    return True
         return False
     except FileNotFoundError:
         return False
