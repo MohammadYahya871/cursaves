@@ -881,6 +881,13 @@ def _pull_behind(sync_dir: Path) -> int:
                         all_matches.append(ws)
 
             if not all_matches:
+                sources = ", ".join(sorted(project.get("source_paths", set()))[:3]) or project.get("name", "?")
+                n = len(behind_snapshots)
+                print(
+                    f"  Skipping {n} chat(s) for {project.get('name', '?')}: "
+                    f"no local workspace matches ({sources})",
+                    flush=True,
+                )
                 continue
 
             # Build a map: composerId -> list of workspaces that have it registered

@@ -473,30 +473,74 @@ def get_machine_id() -> str:
 # ── Workspace matching for imports ─────────────────────────────────────
 
 
+def normalize_project_path(path: str) -> str:
+    """Normalize Cursor/OS project paths for cross-machine comparison.
+
+    Handles Windows backslashes, URI-encoded segments (``%3A``), and
+    Cursor's ``\\c%3A\\Users\\...`` / ``/c:/Users/...`` forms.
+    """
+    from urllib.parse import unquote
+
+    if not path:
+        return ""
+    p = unquote(str(path).strip())
+    p = p.replace("\\", "/")
+    # Cursor often stores Windows roots as /c:/Users/... or /c%3A/Users/...
+    p = re.sub(r"^/([A-Za-z]):(/|$)", r"\1:\2", p)
+    p = re.sub(r"^([A-Za-z]):/", lambda m: m.group(1).upper() + ":/", p)
+    # Collapse duplicate slashes but keep Windows drive prefix
+    if re.match(r"^[A-Za-z]:/", p):
+        drive, rest = p[:2], p[2:]
+        rest = re.sub(r"/+", "/", rest)
+        p = drive + rest
+    else:
+        p = re.sub(r"/+", "/", p)
+    return p.rstrip("/") or p
+
+
+def project_match_keys(path: str) -> set[str]:
+    """Keys used to match the same project across machines/layouts.
+
+    ``menusbee.code-workspace`` and ``.../menusbee`` both yield ``menusbee``.
+    """
+    p = normalize_project_path(path)
+    if not p:
+        return set()
+    base = p.split("/")[-1]
+    keys = {base.lower()}
+    if base.lower().endswith(".code-workspace"):
+        keys.add(base[: -len(".code-workspace")].lower())
+    # Drop a trailing .git if present
+    if base.lower().endswith(".git"):
+        keys.add(base[:-4].lower())
+    return {k for k in keys if k}
+
+
 def find_all_matching_workspaces(source_path: str) -> list[dict]:
     """Find all workspaces that could receive imports from source_path.
 
     Matches by:
-    1. Exact path match (for SSH workspaces with same remote path)
-    2. Same basename (fallback for different directory structures)
+    1. Exact normalized path match
+    2. Shared project key (basename / ``name.code-workspace`` ↔ ``name``)
 
     Returns list of workspace dicts with type, host, path, workspace_dir,
     sorted by match quality (exact matches first) then by mtime.
     """
     all_ws = list_all_workspaces()
-    source_normalized = os.path.normpath(source_path)
-    source_basename = os.path.basename(source_normalized)
+    source_normalized = normalize_project_path(source_path)
+    source_keys = project_match_keys(source_path)
 
     exact_matches = []
     basename_matches = []
 
     for ws in all_ws:
         ws_path = ws["path"]
-        ws_basename = os.path.basename(ws_path)
+        ws_normalized = normalize_project_path(ws_path)
+        ws_keys = project_match_keys(ws_path)
 
-        if ws_path == source_normalized:
+        if source_normalized and ws_normalized == source_normalized:
             exact_matches.append(ws)
-        elif ws_basename == source_basename:
+        elif source_keys and ws_keys and (source_keys & ws_keys):
             basename_matches.append(ws)
 
     # Return exact matches first, then basename matches
