@@ -212,6 +212,63 @@ class CursorDB:
         ]
         self.write_batch(serialized, table=table)
 
+    def has_composer_headers_table(self) -> bool:
+        """True when Cursor 3.x dedicated composerHeaders table exists."""
+        conn = self._ensure_read_copy()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='composerHeaders'"
+            ).fetchone()
+            return row is not None
+        except sqlite3.OperationalError:
+            return False
+
+    def upsert_composer_header(
+        self,
+        composer_id: str,
+        workspace_id: str,
+        entry: dict,
+        *,
+        is_archived: bool = False,
+        is_subagent: bool = False,
+        checkpoint_at: Optional[int] = None,
+    ) -> None:
+        """Upsert a row in the Cursor 3.x ``composerHeaders`` table (sidebar source)."""
+        created = int(entry.get("createdAt") or 0) or None
+        updated = int(entry.get("lastUpdatedAt") or entry.get("createdAt") or 0) or None
+        recency = updated or created
+        value = json.dumps(entry, separators=(",", ":"))
+        conn = self._get_write_conn()
+        conn.execute(
+            """
+            INSERT INTO composerHeaders (
+                composerId, workspaceId, createdAt, lastUpdatedAt,
+                isArchived, isSubagent, recency, checkpointAt, value
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(composerId) DO UPDATE SET
+                workspaceId=excluded.workspaceId,
+                createdAt=COALESCE(excluded.createdAt, composerHeaders.createdAt),
+                lastUpdatedAt=excluded.lastUpdatedAt,
+                isArchived=excluded.isArchived,
+                isSubagent=excluded.isSubagent,
+                recency=excluded.recency,
+                checkpointAt=COALESCE(excluded.checkpointAt, composerHeaders.checkpointAt),
+                value=excluded.value
+            """,
+            (
+                composer_id,
+                workspace_id,
+                created,
+                updated,
+                1 if is_archived else 0,
+                1 if is_subagent else 0,
+                recency,
+                checkpoint_at,
+                value,
+            ),
+        )
+        conn.commit()
+
     def delete_keys(self, keys: list[str], table: str = "cursorDiskKV") -> int:
         """Delete multiple keys in a single transaction on the ORIGINAL database.
 

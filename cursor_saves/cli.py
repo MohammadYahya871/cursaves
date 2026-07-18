@@ -14,6 +14,7 @@ from .importer import (
     copy_between_workspaces,
     doctor_audit,
     doctor_recover,
+    repair_composer_headers_table,
     find_snapshot_dir_for_project,
     format_sync_status,
     get_push_status_for_conversation,
@@ -981,6 +982,11 @@ def cmd_sync(args):
     else:
         print("  Everything up to date")
 
+    # Cursor 3.x sidebar uses composerHeaders table; keep it in sync with JSON index
+    repaired = repair_composer_headers_table()
+    if repaired:
+        print(f"  Synced {repaired} chat(s) into Cursor sidebar index")
+
     # Step 3: Push — export ahead conversations from Cursor DBs into snapshots
     print("\n── Push ──")
     pushed = _push_ahead(sync_dir, auto=True, backend=backend)
@@ -1574,6 +1580,11 @@ def cmd_doctor(args):
         for ws in audit["workspaces"]:
             print(f"  {ws['chat_count']:>3} chats   {ws['label']}")
         print()
+
+    # Always ensure Cursor 3.x sidebar table matches legacy JSON index
+    repaired = repair_composer_headers_table()
+    if repaired:
+        print(f"  Repaired {repaired} sidebar header(s) in composerHeaders table.\n")
 
     orphaned = audit["orphaned"]
     if not orphaned:

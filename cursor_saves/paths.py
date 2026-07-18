@@ -257,21 +257,38 @@ def list_all_workspaces() -> list[dict]:
 
 
 def get_global_composer_headers() -> list[dict]:
-    """Read the central composer.composerHeaders from the global DB.
+    """Read the central chat index from the global DB.
 
-    Returns the allComposers list from composer.composerHeaders in the
-    global DB's ItemTable. In Cursor 3.0+ this is the authoritative
-    index of all chats, each tagged with a workspaceIdentifier.
-
-    Returns an empty list if not present (pre-3.0 Cursor).
+    Prefer the Cursor 3.x ``composerHeaders`` SQL table when present (that is
+    what the sidebar uses when tableGateEnabled). Fall back to ItemTable
+    ``composer.composerHeaders`` JSON for older layouts.
     """
     from . import db
+    import json as _json
 
     global_db = get_global_db_path()
     if not global_db.exists():
         return []
     try:
         with db.CursorDB(global_db) as cdb:
+            if cdb.has_composer_headers_table():
+                conn = cdb._ensure_read_copy()
+                rows = conn.execute(
+                    "SELECT value FROM composerHeaders WHERE IFNULL(isArchived,0)=0"
+                ).fetchall()
+                out: list[dict] = []
+                for (raw,) in rows:
+                    if not raw:
+                        continue
+                    try:
+                        entry = _json.loads(raw)
+                    except Exception:
+                        continue
+                    if isinstance(entry, dict):
+                        out.append(entry)
+                if out:
+                    return out
+
             headers = cdb.get_json("composer.composerHeaders", table="ItemTable")
             if headers and isinstance(headers, dict):
                 return headers.get("allComposers", [])

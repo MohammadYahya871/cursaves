@@ -901,14 +901,19 @@ def _register_in_global_headers(
     composer_data: dict,
     ws_dir: Path,
 ) -> None:
-    """Register a conversation in the global composer.composerHeaders index.
+    """Register a conversation in Cursor's global chat index.
 
-    This is the Cursor 3.0+ central index that maps chats to workspaces.
-    Safe to call on any Cursor version — creates the index if absent.
+    Writes both:
+      - ItemTable ``composer.composerHeaders`` (legacy / migration source)
+      - ``composerHeaders`` SQL table (Cursor 3.x sidebar when tableGateEnabled)
     """
     global_db_path = paths.get_global_db_path()
     global_cdb = db.CursorDB(global_db_path)
     try:
+        entry = _build_composer_header_entry(composer_id, composer_data)
+        ws_ident = _build_workspace_identifier(ws_dir)
+        entry["workspaceIdentifier"] = ws_ident
+
         headers = global_cdb.get_json("composer.composerHeaders", table="ItemTable")
         if headers is None:
             headers = {"allComposers": []}
@@ -917,14 +922,70 @@ def _register_in_global_headers(
         existing_ids = {c.get("composerId") for c in all_composers}
 
         if composer_id not in existing_ids:
-            entry = _build_composer_header_entry(composer_id, composer_data)
-            entry["workspaceIdentifier"] = _build_workspace_identifier(ws_dir)
             all_composers.append(entry)
             headers["allComposers"] = all_composers
             global_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
             paths.invalidate_headers_cache()
+        else:
+            # Keep legacy JSON entry's workspace mapping in sync
+            for i, c in enumerate(all_composers):
+                if c.get("composerId") == composer_id:
+                    merged = dict(c)
+                    merged.update({k: v for k, v in entry.items() if v not in ("", 0, None, [])})
+                    merged["workspaceIdentifier"] = ws_ident
+                    all_composers[i] = merged
+                    headers["allComposers"] = all_composers
+                    global_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
+                    paths.invalidate_headers_cache()
+                    entry = merged
+                    break
+
+        # Cursor 3.x sidebar reads this table when tableGateEnabled is set
+        if global_cdb.has_composer_headers_table():
+            global_cdb.upsert_composer_header(
+                composer_id,
+                ws_ident.get("id", ws_dir.name),
+                entry,
+                is_archived=bool(entry.get("isArchived")),
+                is_subagent=bool(entry.get("isBestOfNSubcomposer")),
+            )
     finally:
         global_cdb.close()
+
+
+def repair_composer_headers_table() -> int:
+    """Copy ItemTable composer.composerHeaders entries into composerHeaders table.
+
+    Needed after imports that only wrote the legacy JSON index. Returns rows upserted.
+    """
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        return 0
+
+    cdb = db.CursorDB(global_db_path)
+    try:
+        if not cdb.has_composer_headers_table():
+            return 0
+        headers = cdb.get_json("composer.composerHeaders", table="ItemTable") or {}
+        all_composers = headers.get("allComposers") or []
+        n = 0
+        for entry in all_composers:
+            cid = entry.get("composerId")
+            if not cid:
+                continue
+            wi = entry.get("workspaceIdentifier") or {}
+            ws_id = wi.get("id") or "unknown"
+            cdb.upsert_composer_header(
+                cid,
+                ws_id,
+                entry,
+                is_archived=bool(entry.get("isArchived")),
+                is_subagent=bool(entry.get("isBestOfNSubcomposer")),
+            )
+            n += 1
+        return n
+    finally:
+        cdb.close()
 
 
 def _register_in_workspace(
