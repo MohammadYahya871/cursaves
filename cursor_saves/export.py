@@ -11,6 +11,52 @@ from typing import Any, Optional
 
 from . import db, paths
 
+# Default: only sync chats touched in the last 2 weeks.
+# Set CURSAVES_MAX_AGE_DAYS=0 to disable the age filter.
+DEFAULT_MAX_AGE_DAYS = 14
+
+
+def get_max_age_days() -> int:
+    """Max age (days) for chats to include in push/sync. 0 = no limit."""
+    raw = os.environ.get("CURSAVES_MAX_AGE_DAYS", str(DEFAULT_MAX_AGE_DAYS))
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_MAX_AGE_DAYS
+
+
+def conversation_ts_ms(cd: Optional[dict]) -> int:
+    """Best-effort activity timestamp in milliseconds from composerData."""
+    if not cd:
+        return 0
+    ts = cd.get("lastUpdatedAt") or cd.get("createdAt") or 0
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        return 0
+    if ts <= 0:
+        return 0
+    # Cursor usually stores ms; treat small values as seconds
+    if ts < 1e12:
+        return int(ts * 1000)
+    return int(ts)
+
+
+def conversation_within_max_age(
+    cd: Optional[dict],
+    max_age_days: Optional[int] = None,
+) -> bool:
+    """True if the conversation was active within max_age_days (or filter disabled)."""
+    if max_age_days is None:
+        max_age_days = get_max_age_days()
+    if max_age_days <= 0:
+        return True
+    ts_ms = conversation_ts_ms(cd)
+    if ts_ms <= 0:
+        return False
+    cutoff_ms = (time.time() - max_age_days * 86400) * 1000
+    return ts_ms >= cutoff_ms
+
 
 def get_workspace_conversations(
     project_path: str,
@@ -613,6 +659,8 @@ def checkpoint_project(
     print(f"  Found {len(conversations)} conversation(s) in workspace(s)", file=sys.stderr, flush=True)
 
     # Filter to selected ids and count how many we'll actually process
+    max_age_days = get_max_age_days()
+    skipped_old = 0
     to_process: list[tuple[dict, str]] = []
     for c in conversations:
         composer_id: str | None = c.get("composerId")
@@ -620,8 +668,19 @@ def checkpoint_project(
             continue
         if composer_ids is not None and composer_id not in composer_ids:
             continue
+        # Age filter uses fields already on the conversation list entry when present
+        if max_age_days > 0 and not conversation_within_max_age(c, max_age_days):
+            skipped_old += 1
+            continue
         to_process.append((c, composer_id))
 
+    if max_age_days > 0:
+        print(
+            f"  Age filter: last {max_age_days} day(s)"
+            + (f" (skipped {skipped_old} older)" if skipped_old else ""),
+            file=sys.stderr,
+            flush=True,
+        )
     print(f"  Processing {len(to_process)} conversation(s)...", file=sys.stderr, flush=True)
 
     last_log_time = t0

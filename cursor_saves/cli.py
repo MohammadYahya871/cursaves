@@ -615,6 +615,8 @@ def _find_ahead_conversations() -> list[dict]:
     """Scan all workspaces for conversations that are ahead of their snapshots."""
     workspaces = paths.list_workspaces_with_conversations()
     ahead_items: list[dict] = []
+    max_age_days = export.get_max_age_days()
+    skipped_old = 0
 
     global_db_path = paths.get_global_db_path()
     if not global_db_path.exists():
@@ -648,6 +650,10 @@ def _find_ahead_conversations() -> list[dict]:
                     if bubble_count == 0:
                         continue
 
+                if not export.conversation_within_max_age(cd, max_age_days):
+                    skipped_old += 1
+                    continue
+
                 ws_name = os.path.basename(os.path.normpath(ws["path"])) or ws["path"]
                 host = ws.get("host", "")
                 ws_label = f"{ws_name} ({host})" if host else ws_name
@@ -659,6 +665,13 @@ def _find_ahead_conversations() -> list[dict]:
                     "project_path": ws["path"],
                     "host": host,
                 })
+
+    if max_age_days > 0:
+        print(
+            f"  Age filter: last {max_age_days} day(s)"
+            + (f" (skipped {skipped_old} older)" if skipped_old else ""),
+            flush=True,
+        )
 
     return ahead_items
 
