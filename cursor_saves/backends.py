@@ -16,10 +16,65 @@ import subprocess
 import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional, Sequence
 
 
 _CONFIG_PATH = Path.home() / ".config" / "cursaves" / "config.json"
+
+
+def expand_snapshot_export_paths(saved: Sequence[Path]) -> list[Path]:
+    """Expand checkpoint return paths to include meta sidecars and shards.
+
+    ``save_snapshot`` returns the logical ``{id}.json.gz`` path even when the
+    payload was written as ``{id}.json.gz.00`` shards.
+    """
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for path in saved:
+        path = Path(path)
+        parent = path.parent
+        name = path.name
+        if name.endswith(".json.gz"):
+            composer_id = name[: -len(".json.gz")]
+        elif ".json.gz." in name:
+            composer_id = name.split(".json.gz.", 1)[0]
+        else:
+            # Unknown shape — still try to add the path itself
+            if path.exists() and path not in seen:
+                seen.add(path)
+                out.append(path)
+            continue
+
+        for candidate in parent.glob(f"{composer_id}.json.gz*"):
+            if candidate.name.endswith(".meta.json"):
+                continue
+            if candidate not in seen:
+                seen.add(candidate)
+                out.append(candidate)
+        meta = parent / f"{composer_id}.meta.json"
+        if meta.exists() and meta not in seen:
+            seen.add(meta)
+            out.append(meta)
+    return out
+
+
+def _format_bytes(num: int) -> str:
+    if num < 1024:
+        return f"{num} B"
+    if num < 1024 * 1024:
+        return f"{num / 1024:.1f} KiB"
+    return f"{num / (1024 * 1024):.1f} MiB"
+
+
+def _paths_total_size(paths: Iterable[Path]) -> int:
+    total = 0
+    for path in paths:
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:
+            continue
+    return total
 
 
 # ── Abstract base ────────────────────────────────────────────────────────
@@ -37,12 +92,19 @@ class SyncBackend(ABC):
         """
 
     @abstractmethod
-    def push(self, snapshots_dir: Path) -> bool:
+    def push(
+        self,
+        snapshots_dir: Path,
+        only_paths: Optional[Sequence[Path]] = None,
+    ) -> bool:
         """Upload local snapshots from *snapshots_dir* to the remote.
+
+        If *only_paths* is given, upload/commit just those files (plus callers
+        should already expand meta/shards). If None, sync the whole tree
+        (used for deletes / full flush).
 
         Returns True on success, False on failure.
         """
-
     @abstractmethod
     def has_remote(self) -> bool:
         """Return True if a remote target is configured."""
@@ -68,17 +130,43 @@ class GitBackend(SyncBackend):
             return True
         return self._reset_to_origin()
 
-    def push(self, snapshots_dir: Path) -> bool:
-        subprocess.run(
-            ["git", "add", "snapshots/"],
-            cwd=str(self.sync_dir), capture_output=True,
-        )
+    def push(
+        self,
+        snapshots_dir: Path,
+        only_paths: Optional[Sequence[Path]] = None,
+    ) -> bool:
+        if only_paths is not None:
+            files = expand_snapshot_export_paths(list(only_paths))
+            if not files:
+                return True
+            self._warn_snapshot_backlog(snapshots_dir, files)
+            rels = self._rels_under_sync_dir(files)
+            if not rels:
+                return True
+            subprocess.run(
+                ["git", "add", "--"] + rels,
+                cwd=str(self.sync_dir), capture_output=True,
+            )
+        else:
+            subprocess.run(
+                ["git", "add", "snapshots/"],
+                cwd=str(self.sync_dir), capture_output=True,
+            )
+
         result = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
             cwd=str(self.sync_dir), capture_output=True,
         )
         if result.returncode == 0:
             return True  # nothing to commit
+
+        staged = self._staged_snapshot_files()
+        staged_size = _paths_total_size(staged)
+        print(
+            f"  Commit {len(staged)} file(s), {_format_bytes(staged_size)}"
+            + (" (scoped to this export)" if only_paths is not None else " (full snapshots/)"),
+            flush=True,
+        )
 
         from . import paths
         hostname = paths.get_machine_id()
@@ -89,6 +177,11 @@ class GitBackend(SyncBackend):
         )
 
         if self.has_remote():
+            print(
+                f"  Pushing {_format_bytes(staged_size)} to origin...",
+                end="",
+                flush=True,
+            )
             try:
                 push_result = subprocess.run(
                     ["git", "push", "-u", "origin", "main"],
@@ -96,12 +189,82 @@ class GitBackend(SyncBackend):
                     capture_output=True, text=True, timeout=600,
                 )
                 if push_result.returncode != 0:
+                    print(" failed", file=sys.stderr)
                     print(f"  Push failed: {push_result.stderr.strip()}", file=sys.stderr)
                     return False
             except subprocess.TimeoutExpired:
-                print("  Push timed out", file=sys.stderr)
+                print(" timed out", file=sys.stderr)
                 return False
+            print(" done", flush=True)
         return True
+
+    def _rels_under_sync_dir(self, files: Sequence[Path]) -> list[str]:
+        rels: list[str] = []
+        sync_root = self.sync_dir.resolve()
+        for path in files:
+            try:
+                resolved = path.resolve()
+                rel = resolved.relative_to(sync_root)
+            except (OSError, ValueError):
+                continue
+            rels.append(str(rel))
+        return rels
+
+    def _staged_snapshot_files(self) -> list[Path]:
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--name-only", "--", "snapshots/"],
+            cwd=str(self.sync_dir), capture_output=True, text=True,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        return [
+            self.sync_dir / line
+            for line in result.stdout.splitlines()
+            if line.strip()
+        ]
+
+    def _warn_snapshot_backlog(
+        self,
+        snapshots_dir: Path,
+        exporting: Sequence[Path],
+    ) -> None:
+        """Warn when other uncommitted snapshot files exist beyond this export."""
+        exporting_set = {p.resolve() for p in exporting if p.exists()}
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--", "snapshots/"],
+            cwd=str(self.sync_dir), capture_output=True, text=True,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return
+
+        backlog: list[Path] = []
+        for line in result.stdout.splitlines():
+            # porcelain: XY path  (or XY origin -> path for renames)
+            if len(line) < 4:
+                continue
+            entry = line[3:].strip()
+            if " -> " in entry:
+                entry = entry.split(" -> ", 1)[1].strip()
+            # Unquoted paths only (cursaves snapshot names are safe)
+            path = (self.sync_dir / entry).resolve()
+            if path in exporting_set:
+                continue
+            if path.exists() and path.is_file():
+                backlog.append(path)
+
+        if not backlog:
+            return
+
+        backlog_size = _paths_total_size(backlog)
+        export_size = _paths_total_size(exporting)
+        print(
+            f"  Note: {_format_bytes(backlog_size)} in {len(backlog)} other uncommitted "
+            f"snapshot file(s) not included in this push "
+            f"(this export is {_format_bytes(export_size)}). "
+            f"Use a full `cursaves push` / migrate if you want them synced.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def has_remote(self) -> bool:
         try:
@@ -299,7 +462,11 @@ class S3Backend(SyncBackend):
             print(f"S3 pull failed: {e}", file=sys.stderr)
             return False
 
-    def push(self, snapshots_dir: Path) -> bool:
+    def push(
+        self,
+        snapshots_dir: Path,
+        only_paths: Optional[Sequence[Path]] = None,
+    ) -> bool:
         """Upload local snapshot files that are newer or missing remotely."""
         client = self._get_client()
         try:
@@ -313,11 +480,20 @@ class S3Backend(SyncBackend):
                     if rel:
                         remote_index[rel] = (obj["LastModified"].timestamp(), obj["Size"])
 
+            if only_paths is not None:
+                candidates = expand_snapshot_export_paths(list(only_paths))
+            else:
+                candidates = [p for p in snapshots_dir.rglob("*") if p.is_file()]
+
             uploaded = 0
-            for local_path in snapshots_dir.rglob("*"):
+            uploaded_bytes = 0
+            for local_path in candidates:
                 if not local_path.is_file():
                     continue
-                rel = str(local_path.relative_to(snapshots_dir))
+                try:
+                    rel = str(local_path.resolve().relative_to(snapshots_dir.resolve()))
+                except ValueError:
+                    continue
                 remote_key = self.prefix + rel
 
                 local_mtime = local_path.stat().st_mtime
@@ -330,9 +506,13 @@ class S3Backend(SyncBackend):
 
                 client.upload_file(str(local_path), self.bucket, remote_key)
                 uploaded += 1
+                uploaded_bytes += local_size
 
             if uploaded:
-                print(f"  Uploaded {uploaded} file(s) to s3://{self.bucket}")
+                print(
+                    f"  Uploaded {uploaded} file(s) ({_format_bytes(uploaded_bytes)}) "
+                    f"to s3://{self.bucket}"
+                )
             return True
 
         except Exception as e:

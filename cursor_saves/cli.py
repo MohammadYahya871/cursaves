@@ -690,6 +690,7 @@ def _export_and_push(sync_dir: Path, items: list[dict], backend: Optional[SyncBa
         by_workspace[key].append(item)
 
     total_saved = 0
+    saved_paths: list[Path] = []
     for (project_path, ws_dir_str), ws_items in by_workspace.items():
         ws_dir = Path(ws_dir_str)
         host = ws_items[0].get("host")
@@ -701,6 +702,7 @@ def _export_and_push(sync_dir: Path, items: list[dict], backend: Optional[SyncBa
             source_host=host or None,
         )
         total_saved += len(saved)
+        saved_paths.extend(saved)
 
     if total_saved == 0:
         return 0
@@ -710,11 +712,11 @@ def _export_and_push(sync_dir: Path, items: list[dict], backend: Optional[SyncBa
 
     snapshots_dir = paths.get_snapshots_dir()
     if backend.has_remote():
-        print("  Pushing...", end="", flush=True)
-        if backend.push(snapshots_dir):
-            print(" done")
-        else:
-            print(" failed", file=sys.stderr)
+        if not backend.push(snapshots_dir, only_paths=saved_paths):
+            print("  Push failed", file=sys.stderr)
+    else:
+        # Still commit locally when there is no remote
+        backend.push(snapshots_dir, only_paths=saved_paths)
 
     return total_saved
 
@@ -1063,15 +1065,13 @@ def cmd_push(args):
 
     print(f"  {len(saved)} conversation(s) checkpointed")
 
-    # Step 2: Push to remote
+    # Step 2: Push only what this checkpoint wrote (avoid sweeping old local dirt)
     if backend.has_remote():
-        print("  Pushing...", end="", flush=True)
-        if backend.push(snapshots_dir):
-            print(" done")
-        else:
-            print(" failed", file=sys.stderr)
+        if not backend.push(snapshots_dir, only_paths=saved):
+            print("  Push failed", file=sys.stderr)
     else:
-        print("  No remote configured, skipping push")
+        print("  No remote configured — committing locally only")
+        backend.push(snapshots_dir, only_paths=saved)
 
     print(f"\nDone. {len(saved)} conversation(s) saved.")
 
