@@ -93,7 +93,7 @@ class GitBackend(SyncBackend):
                 push_result = subprocess.run(
                     ["git", "push", "-u", "origin", "main"],
                     cwd=str(self.sync_dir),
-                    capture_output=True, text=True, timeout=120,
+                    capture_output=True, text=True, timeout=600,
                 )
                 if push_result.returncode != 0:
                     print(f"  Push failed: {push_result.stderr.strip()}", file=sys.stderr)

@@ -635,22 +635,30 @@ def _find_ahead_conversations() -> list[dict]:
 
             for cid in composer_ids:
                 status = get_push_status_for_conversation(cid, project_id, _cdb=global_cdb)
-                if status == "local_ahead":
-                    # Get chat name from global DB
-                    cd = global_cdb.get_json(f"composerData:{cid}")
-                    name = cd.get("name", "Untitled") if cd else "Untitled"
+                # never_pushed = new chat with no snapshot yet (needed for daily sync)
+                if status not in ("local_ahead", "never_pushed"):
+                    continue
+                cd = global_cdb.get_json(f"composerData:{cid}")
+                name = cd.get("name", "Untitled") if cd else "Untitled"
+                # Skip empty stubs — they bloat sync without useful content
+                if status == "never_pushed" and (not cd or not name or name == "Untitled"):
+                    bubble_count = 0
+                    if cd:
+                        bubble_count = len(cd.get("fullConversationHeadersOnly") or cd.get("conversation") or [])
+                    if bubble_count == 0:
+                        continue
 
-                    ws_name = os.path.basename(os.path.normpath(ws["path"])) or ws["path"]
-                    host = ws.get("host", "")
-                    ws_label = f"{ws_name} ({host})" if host else ws_name
-                    ahead_items.append({
-                        "composerId": cid,
-                        "name": name,
-                        "workspace_label": ws_label,
-                        "workspace_dir": ws_dir,
-                        "project_path": ws["path"],
-                        "host": host,
-                    })
+                ws_name = os.path.basename(os.path.normpath(ws["path"])) or ws["path"]
+                host = ws.get("host", "")
+                ws_label = f"{ws_name} ({host})" if host else ws_name
+                ahead_items.append({
+                    "composerId": cid,
+                    "name": name,
+                    "workspace_label": ws_label,
+                    "workspace_dir": ws_dir,
+                    "project_path": ws["path"],
+                    "host": host,
+                })
 
     return ahead_items
 
@@ -981,7 +989,8 @@ def cmd_push(args):
     snapshots_dir = paths.get_snapshots_dir()
 
     if getattr(args, "ahead", False):
-        _push_ahead(sync_dir, backend=backend)
+        # --ahead means push every ahead/never-pushed chat (non-interactive)
+        _push_ahead(sync_dir, auto=True, backend=backend)
         return
 
     # Step 0: Pull latest from remote
@@ -1790,7 +1799,7 @@ def main():
     )
     p_push.add_argument(
         "--ahead", "-a", action="store_true",
-        help="Find and push all conversations ahead of snapshots across all workspaces",
+        help="Find and push all conversations ahead of / missing from snapshots across all workspaces",
     )
     p_push.set_defaults(func=cmd_push)
 
