@@ -870,23 +870,27 @@ def _pull_behind(sync_dir: Path) -> int:
             if not behind_snapshots:
                 continue
 
-            # Find all matching workspaces for this project
-            all_matches = []
-            seen_ws_dirs: set[str] = set()
-            for sp in sorted(project.get("source_paths", set())):
-                matches = paths.find_all_matching_workspaces(sp)
-                for ws in matches:
-                    ws_dir_str = str(ws["workspace_dir"])
-                    if ws_dir_str not in seen_ws_dirs:
-                        seen_ws_dirs.add(ws_dir_str)
-                        all_matches.append(ws)
+            # Prefer git-remote matching (incl. multi-root member remotes)
+            remotes: list[str] = list(project.get("source_remotes") or [])
+            seen_r = set(remotes)
+            for _sf, meta in behind_snapshots:
+                for remote in meta.get("sourceGitRemotes") or []:
+                    if remote and remote not in seen_r:
+                        seen_r.add(remote)
+                        remotes.append(remote)
+
+            all_matches = paths.find_workspaces_for_import(
+                source_paths=project.get("source_paths") or set(),
+                source_remotes=remotes,
+            )
 
             if not all_matches:
                 sources = ", ".join(sorted(project.get("source_paths", set()))[:3]) or project.get("name", "?")
+                remote_hint = f"; remotes={remotes[:3]}" if remotes else ""
                 n = len(behind_snapshots)
                 print(
                     f"  Skipping {n} chat(s) for {project.get('name', '?')}: "
-                    f"no local workspace matches ({sources})",
+                    f"no local workspace matches ({sources}{remote_hint})",
                     flush=True,
                 )
                 continue

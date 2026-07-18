@@ -89,6 +89,7 @@ def read_snapshot_meta(snapshot_path: Path) -> dict:
             "sourceHost": data.get("sourceHost"),
             "sourceProjectPath": data.get("sourceProjectPath"),
             "projectIdentifier": data.get("projectIdentifier"),
+            "sourceGitRemotes": data.get("sourceGitRemotes") or [],
             "version": data.get("version"),
         }
     except Exception:
@@ -638,6 +639,8 @@ def list_snapshot_projects(snapshots_dir: Optional[Path] = None) -> list[dict]:
 
         source_paths = set()
         source_machines = set()
+        source_remotes: list[str] = []
+        seen_remotes: set[str] = set()
         latest_export = None
         for sf in snapshot_files:
             meta = read_snapshot_meta(sf)
@@ -647,6 +650,10 @@ def list_snapshot_projects(snapshots_dir: Optional[Path] = None) -> list[dict]:
             sm = meta.get("sourceMachine", "")
             if sm:
                 source_machines.add(sm)
+            for remote in meta.get("sourceGitRemotes") or []:
+                if remote and remote not in seen_remotes:
+                    seen_remotes.add(remote)
+                    source_remotes.append(remote)
             exported_at = meta.get("exportedAt", "")
             if exported_at and (latest_export is None or exported_at > latest_export):
                 latest_export = exported_at
@@ -656,6 +663,7 @@ def list_snapshot_projects(snapshots_dir: Optional[Path] = None) -> list[dict]:
             "path": project_dir,
             "count": len(snapshot_files),
             "source_paths": source_paths,
+            "source_remotes": source_remotes,
             "sources": source_machines,
             "latest_export": latest_export,
         })
@@ -679,25 +687,41 @@ def find_snapshot_dir_for_project(
     if snapshots_dir is None:
         snapshots_dir = paths.get_snapshots_dir()
 
-    # 1. Exact match by project identifier
+    # 1. Exact match by project identifier (usually git-remote based)
     project_id = paths.get_project_identifier(target_project_path)
     exact = snapshots_dir / project_id
     if exact.exists() and list_snapshot_files(exact):
         return exact
 
-    # 2. Basename match (covers SSH workspace push → local pull)
+    target_remotes = set(paths.get_git_remote_ids_for_path(target_project_path))
+
+    # 2. Scan snapshot metadata for matching git remotes (cross-machine)
+    if target_remotes:
+        for project_dir in snapshots_dir.iterdir():
+            if not project_dir.is_dir() or project_dir == exact:
+                continue
+            for sf in list_snapshot_files(project_dir):
+                meta = read_snapshot_meta(sf)
+                snap_remotes = set(meta.get("sourceGitRemotes") or [])
+                if not snap_remotes:
+                    # Older snapshots: try resolving from source path if local
+                    sp = meta.get("sourceProjectPath") or ""
+                    if sp:
+                        snap_remotes = set(paths.get_git_remote_ids_for_path(sp))
+                if target_remotes & snap_remotes:
+                    return project_dir
+                break
+
+    # 3. Basename match (covers SSH workspace push → local pull)
     basename = os.path.basename(os.path.normpath(target_project_path))
     basename_dir = snapshots_dir / basename
     if basename_dir.exists() and basename_dir != exact and list_snapshot_files(basename_dir):
         return basename_dir
 
-    # 3. Scan snapshot dirs for matching source path basenames
-    # This handles the case where the project was pushed from a different
-    # machine with a different directory structure but same repo
+    # 4. Scan snapshot dirs for matching source path basenames
     for project_dir in snapshots_dir.iterdir():
         if not project_dir.is_dir() or project_dir == exact or project_dir == basename_dir:
             continue
-        # Check first snapshot file for a matching source path basename
         for sf in list_snapshot_files(project_dir):
             try:
                 data = read_snapshot_file(sf)

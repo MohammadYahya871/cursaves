@@ -522,6 +522,8 @@ def export_conversation(
             "sourceHost": source_host,
             "sourceProjectPath": os.path.normpath(project_path),
             "projectIdentifier": paths.get_project_identifier(project_path),
+            # Remotes for cross-machine matching (incl. multi-root members)
+            "sourceGitRemotes": paths.get_git_remote_ids_for_path(project_path),
             "composerId": composer_id,
             "composerData": conv_data,
             "contentBlobs": blobs,
@@ -628,6 +630,7 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
         "sourceHost": snapshot.get("sourceHost"),
         "sourceProjectPath": snapshot.get("sourceProjectPath"),
         "projectIdentifier": snapshot.get("projectIdentifier"),
+        "sourceGitRemotes": snapshot.get("sourceGitRemotes") or [],
         "version": snapshot.get("version"),
         "shardCount": num_shards if num_shards else None,
     }

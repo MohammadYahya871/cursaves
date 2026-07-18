@@ -533,35 +533,177 @@ def project_match_keys(path: str) -> set[str]:
     return {k for k in keys if k}
 
 
-def find_all_matching_workspaces(source_path: str) -> list[dict]:
-    """Find all workspaces that could receive imports from source_path.
+def _uri_to_fs_path(uri: str) -> Optional[str]:
+    """Convert a file:// or plain path from a .code-workspace folder entry."""
+    from urllib.parse import unquote as _unquote
 
-    Matches by:
-    1. Exact normalized path match
-    2. Shared project key (basename / ``name.code-workspace`` ↔ ``name``)
+    if not uri:
+        return None
+    uri = _unquote(str(uri).strip())
+    if uri.startswith("file://"):
+        path = uri[len("file://") :]
+        # Windows file:///c:/...
+        if re.match(r"^/[A-Za-z]:", path):
+            path = path[1:]
+        return os.path.normpath(path.replace("%20", " "))
+    if uri.startswith("vscode-remote://"):
+        parts = uri.split("/", 3)
+        if len(parts) >= 4:
+            return os.path.normpath("/" + parts[3])
+        return None
+    if uri.startswith("/") or re.match(r"^[A-Za-z]:", uri):
+        return os.path.normpath(uri.replace("\\", "/"))
+    return None
 
-    Returns list of workspace dicts with type, host, path, workspace_dir,
-    sorted by match quality (exact matches first) then by mtime.
+
+def resolve_workspace_member_paths(project_path: str) -> list[str]:
+    """Filesystem folders for a project path or multi-root .code-workspace."""
+    p = normalize_project_path(project_path)
+    if not p:
+        return []
+    # On this machine, prefer the raw path if it exists (handles symlinks)
+    candidates = [project_path, p]
+    for cand in candidates:
+        if cand and os.path.isfile(cand) and cand.endswith(".code-workspace"):
+            try:
+                data = json.loads(Path(cand).read_text())
+            except (OSError, json.JSONDecodeError):
+                return [os.path.normpath(cand)]
+            folders = data.get("folders") or []
+            out: list[str] = []
+            ws_dir = os.path.dirname(os.path.abspath(cand))
+            for entry in folders:
+                if not isinstance(entry, dict):
+                    continue
+                fp = entry.get("path") or entry.get("uri")
+                if not fp:
+                    continue
+                if fp.startswith("file:") or fp.startswith("vscode-remote:"):
+                    resolved = _uri_to_fs_path(fp)
+                else:
+                    resolved = fp if os.path.isabs(fp) else os.path.normpath(os.path.join(ws_dir, fp))
+                if resolved:
+                    out.append(resolved)
+            return out or [os.path.normpath(cand)]
+        if cand and os.path.isdir(cand):
+            return [os.path.normpath(cand)]
+    # Path may be from another machine — still return normalized for basename keys
+    if p.endswith(".code-workspace") or os.path.basename(p).endswith(".code-workspace"):
+        return [p]
+    return [p] if p else []
+
+
+def get_git_remote_ids_for_path(project_path: str) -> list[str]:
+    """Normalized git remote IDs for a folder or all members of a .code-workspace.
+
+    Returns a de-duplicated list (stable order). Empty if no remotes resolve
+    locally (e.g. Windows path inspected on Linux).
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for folder in resolve_workspace_member_paths(project_path):
+        # git -C needs a directory
+        target = folder
+        if os.path.isfile(folder):
+            continue
+        if not os.path.isdir(folder):
+            continue
+        url = _get_git_remote_url(folder)
+        if not url:
+            continue
+        rid = _normalize_remote_url(url)
+        if rid and rid not in seen:
+            seen.add(rid)
+            out.append(rid)
+    return out
+
+
+def find_all_matching_workspaces(
+    source_path: str,
+    source_remotes: Optional[list[str]] = None,
+) -> list[dict]:
+    """Find local workspaces that could receive imports from source_path.
+
+    Preference order:
+    1. Exact normalized path
+    2. Shared git remote (folder or multi-root member remotes)
+    3. Basename / ``name.code-workspace`` ↔ ``name`` keys
+
+    ``source_remotes`` should be the remotes recorded at export time when the
+    source path is not available on this machine.
     """
     all_ws = list_all_workspaces()
     source_normalized = normalize_project_path(source_path)
     source_keys = project_match_keys(source_path)
+    remote_set = {r for r in (source_remotes or []) if r}
+    # Also try resolving remotes from a local copy of the source path
+    for r in get_git_remote_ids_for_path(source_path):
+        remote_set.add(r)
 
-    exact_matches = []
-    basename_matches = []
+    exact_matches: list[dict] = []
+    remote_matches: list[dict] = []
+    basename_matches: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(bucket: list[dict], ws: dict) -> None:
+        key = str(ws["workspace_dir"])
+        if key in seen:
+            return
+        seen.add(key)
+        bucket.append(ws)
 
     for ws in all_ws:
         ws_path = ws["path"]
         ws_normalized = normalize_project_path(ws_path)
         ws_keys = project_match_keys(ws_path)
+        ws_remotes = set(get_git_remote_ids_for_path(ws_path))
 
         if source_normalized and ws_normalized == source_normalized:
-            exact_matches.append(ws)
+            _add(exact_matches, ws)
+        elif remote_set and ws_remotes and (remote_set & ws_remotes):
+            _add(remote_matches, ws)
         elif source_keys and ws_keys and (source_keys & ws_keys):
-            basename_matches.append(ws)
+            _add(basename_matches, ws)
 
-    # Return exact matches first, then basename matches
-    return exact_matches + basename_matches
+    # Prefer full multi-root coverage, then more remote overlap, then newer
+    def _remote_score(ws: dict) -> tuple:
+        ws_remotes = set(get_git_remote_ids_for_path(ws["path"]))
+        overlap = len(remote_set & ws_remotes)
+        full = 1 if remote_set and remote_set <= ws_remotes else 0
+        return (full, overlap, ws.get("mtime") or 0)
+
+    remote_matches.sort(key=_remote_score, reverse=True)
+
+    return exact_matches + remote_matches + basename_matches
+
+
+def find_workspaces_for_import(
+    source_paths: Optional[set[str]] = None,
+    source_remotes: Optional[list[str]] = None,
+) -> list[dict]:
+    """Union of matches across snapshot source paths + recorded remotes."""
+    source_paths = source_paths or set()
+    remotes = list(source_remotes or [])
+    matches: list[dict] = []
+    seen: set[str] = set()
+
+    paths_to_try = sorted(source_paths) if source_paths else [""]
+    for sp in paths_to_try:
+        for ws in find_all_matching_workspaces(sp or "", source_remotes=remotes):
+            key = str(ws["workspace_dir"])
+            if key not in seen:
+                seen.add(key)
+                matches.append(ws)
+
+    # Remotes-only pass when source paths are foreign (Windows paths on Linux)
+    if remotes and not matches:
+        for ws in find_all_matching_workspaces("", source_remotes=remotes):
+            key = str(ws["workspace_dir"])
+            if key not in seen:
+                seen.add(key)
+                matches.append(ws)
+
+    return matches
 
 
 def format_workspace_display(ws: dict, include_path: bool = True) -> str:
